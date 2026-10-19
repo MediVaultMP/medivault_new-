@@ -179,6 +179,9 @@ export class MedicalRecordService {
 
     return records.map((record) => this.publicRecord(record));
   }
+  async listRecordAccessRequestsForPatient(patientUserId) {
+    return this.recordAccessRequestRepository.listForPatient(patientUserId);
+  }
 
   async downloadRecordForDoctor(
     doctorUserId,
