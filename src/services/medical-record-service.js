@@ -344,6 +344,7 @@ export class MedicalRecordService {
       patientUserId,
       doctorUserId
     );
+
     const record =
       await this.medicalRecordRepository.findByIdForPatient(
         recordId,
@@ -501,7 +502,9 @@ export class MedicalRecordService {
 
       return {
         recordId: record.id,
-        valid: localValid && blockchainValid !== false,
+        // Full verification requires both local integrity and
+        // an explicit successful blockchain verification.
+        valid: localValid && blockchainValid === true,
         localValid,
         blockchainValid
       };
@@ -636,4 +639,3 @@ export class MedicalRecordService {
     };
   }
 }
-

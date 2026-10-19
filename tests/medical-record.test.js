@@ -220,7 +220,7 @@ describe('medical record API', () => {
       .expect(200, {
         verification: {
           recordId: upload.body.record.id,
-          valid: true,
+          valid: false,
           localValid: true,
           blockchainValid: null
         }

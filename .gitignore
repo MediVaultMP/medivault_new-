@@ -20,3 +20,10 @@ demo-record.pdf
 node_modules/
 frontend/.next/
 coverage/
+
+# Additional local secrets and generated files
+frontend/.env.local
+*.pem
+*.key
+*.dump
+*.backup
