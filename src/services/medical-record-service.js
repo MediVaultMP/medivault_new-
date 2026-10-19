@@ -433,7 +433,16 @@ export class MedicalRecordService {
       .digest('hex');
   }
 
-  hashesMatch(actual, expected) {
+   hashesMatch(actual, expected) {
+    if (
+      typeof actual !== 'string' ||
+      typeof expected !== 'string' ||
+      !/^[a-f0-9]{64}$/i.test(actual) ||
+      !/^[a-f0-9]{64}$/i.test(expected)
+    ) {
+      return false;
+    }
+
     const actualBuffer = Buffer.from(actual, 'hex');
     const expectedBuffer = Buffer.from(expected, 'hex');
 
