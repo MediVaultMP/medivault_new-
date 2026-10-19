@@ -28,10 +28,9 @@ class RecordRepository {
 
 class Storage {
   async put({ body }) { this.body = body; }
-  async get() { return this.body; }
+  async get() { return { body: this.body }; }
   async delete() {}
 }
-
 describe('blockchain record registration', () => {
   it('registers the plaintext SHA-256 hash with an opaque ID after encrypted upload', async () => {
     const calls = [];

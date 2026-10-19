@@ -1,4 +1,4 @@
-﻿
+
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { AppError } from '../utils/app-error.js';
@@ -6,6 +6,7 @@ import { AppError } from '../utils/app-error.js';
 export class MedicalRecordService {
   constructor({
     medicalRecordRepository,
+    recordAccessRequestRepository,
     medicalStorage,
     fileEncryptionService,
     userRepository,
@@ -14,6 +15,7 @@ export class MedicalRecordService {
     auditService
   }) {
     this.medicalRecordRepository = medicalRecordRepository;
+    this.recordAccessRequestRepository = recordAccessRequestRepository;
     this.medicalStorage = medicalStorage;
     this.fileEncryptionService = fileEncryptionService;
     this.userRepository = userRepository;
@@ -199,6 +201,20 @@ export class MedicalRecordService {
         404,
         'Medical record not found.',
         'RECORD_NOT_FOUND'
+      );
+    }
+    const approved =
+      await this.recordAccessRequestRepository.hasApproved({
+        recordId,
+        patientUserId,
+        doctorUserId
+      });
+
+    if (!approved) {
+      throw new AppError(
+        403,
+        'Access to this medical record has not been approved.',
+        'RECORD_ACCESS_NOT_APPROVED'
       );
     }
 
@@ -436,5 +452,67 @@ export class MedicalRecordService {
       blockchainStatus: record.blockchain_status,
       createdAt: record.created_at
     };
+  }
+
+  async requestRecordAccess(
+    doctorUserId,
+    patientUserId,
+    recordId
+  ) {
+    if (doctorUserId === patientUserId) {
+      throw new AppError(
+        400,
+        'You cannot request access to your own patient account.',
+        'INVALID_ACCESS_REQUEST'
+      );
+    }
+
+    await this.consentService.assertDoctorAccess(
+      patientUserId,
+      doctorUserId
+    );
+
+    const record =
+      await this.medicalRecordRepository.findByIdForPatient(
+        recordId,
+        patientUserId
+      );
+
+    if (!record) {
+      throw new AppError(
+        404,
+        'Medical record not found.',
+        'RECORD_NOT_FOUND'
+      );
+    }
+
+    const request =
+      await this.recordAccessRequestRepository.create({
+        recordId,
+        patientUserId,
+        doctorUserId
+      });
+
+    if (!request) {
+      throw new AppError(
+        409,
+        'An access request already exists and cannot be resubmitted.',
+        'ACCESS_REQUEST_EXISTS'
+      );
+    }
+
+    await this.auditService?.record({
+      eventType: 'record_access_requested',
+      actorUserId: doctorUserId,
+      subjectUserId: patientUserId,
+      resourceType: 'medical_record',
+      resourceId: record.id,
+      metadata: {
+        requestId: request.id,
+        status: request.status
+      }
+    });
+
+    return request;
   }
 }

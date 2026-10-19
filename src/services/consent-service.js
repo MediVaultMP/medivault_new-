@@ -1,7 +1,12 @@
 import { AppError } from '../utils/app-error.js';
 
 export class ConsentService {
-  constructor({ consentRepository, userRepository, recordRegistryClient, auditService }) {
+  constructor({
+    consentRepository,
+    userRepository,
+    recordRegistryClient,
+    auditService,
+  }) {
     this.consentRepository = consentRepository;
     this.userRepository = userRepository;
     this.recordRegistryClient = recordRegistryClient;
@@ -9,72 +14,196 @@ export class ConsentService {
   }
 
   async listForPatient(patientUserId) {
-    const consents = await this.consentRepository.listActiveForPatient(patientUserId);
-    return consents.map(c => ({
-      doctorUserId: c.doctor_user_id,
-      doctorEmail: c.doctor_email,
-      expiresAt: c.expires_at,
-      createdAt: c.created_at
+    const consents =
+      await this.consentRepository.listActiveForPatient(patientUserId);
+
+    return consents.map((consent) => ({
+      doctorUserId: consent.doctor_user_id,
+      doctorEmail: consent.doctor_email,
+      doctorName: consent.doctor_name,
+      licenseId: consent.license_id,
+      expiresAt: consent.expires_at,
+      createdAt: consent.created_at,
     }));
   }
 
   async listForDoctor(doctorUserId) {
-    const consents = await this.consentRepository.listActiveForDoctor(doctorUserId);
-    return consents.map(c => ({
-      patientUserId: c.patient_user_id,
-      patientEmail: c.patient_email,
-      expiresAt: c.expires_at,
-      createdAt: c.created_at
+    const consents =
+      await this.consentRepository.listActiveForDoctor(doctorUserId);
+
+    return consents.map((consent) => ({
+      patientUserId: consent.patient_user_id,
+      patientName: consent.patient_name,
+      patientEmail: consent.patient_email,
+      expiresAt: consent.expires_at,
+      createdAt: consent.created_at,
     }));
   }
 
-  async grant(patientUserId, doctorId, expiresAt) {
-    // Check if patient exists
-    const patient = await this.userRepository.findById(patientUserId);
-    if (!patient) {
-      throw new AppError(404, 'Patient not found.', 'PATIENT_NOT_FOUND');
+  async grantByLicense(patientUserId, licenseId, expiresAt) {
+    if (typeof licenseId !== 'string' || !licenseId.trim()) {
+      throw new AppError(
+        400,
+        "Enter the doctor's medical license number.",
+        'LICENSE_REQUIRED',
+      );
     }
 
-    // Check if doctor exists
-    const doctor = await this.userRepository.findById(doctorId);
+    const doctor =
+      await this.userRepository.findActiveDoctorByLicenseId(
+        licenseId.trim(),
+      );
+
     if (!doctor) {
-      throw new AppError(404, 'Doctor not found.', 'DOCTOR_NOT_FOUND');
+      throw new AppError(
+        404,
+        'No active, approved doctor was found for that medical license number.',
+        'DOCTOR_LICENSE_NOT_FOUND',
+      );
     }
 
-    // Check if consent already exists and is active
-    const existing = await this.consentRepository.findActive(patientUserId, doctorId);
+    return this.grant(patientUserId, doctor.id, expiresAt);
+  }
+
+  async grant(patientUserId, doctorId, expiresAt) {
+    const expiry = new Date(expiresAt).getTime();
+
+    if (
+      !expiresAt ||
+      Number.isNaN(expiry) ||
+      expiry <= Date.now()
+    ) {
+      throw new AppError(
+        400,
+        'Consent expiry must be a future date.',
+        'INVALID_CONSENT_EXPIRY',
+      );
+    }
+
+    const patient = await this.userRepository.findById(patientUserId);
+
+    if (!patient || patient.role !== 'patient') {
+      throw new AppError(
+        404,
+        'Patient not found.',
+        'PATIENT_NOT_FOUND',
+      );
+    }
+
+    const doctor = await this.userRepository.findById(doctorId);
+
+    if (
+      !doctor ||
+      doctor.role !== 'doctor' ||
+      doctor.status !== 'active' ||
+      !doctor.license_id
+    ) {
+      throw new AppError(
+        404,
+        'An active doctor with a registered medical license was not found.',
+        'DOCTOR_LICENSE_NOT_FOUND',
+      );
+    }
+
+    const existing = await this.consentRepository.findActive(
+      patientUserId,
+      doctorId,
+    );
+
     if (existing) {
-      throw new AppError(409, 'Consent already exists for this doctor.', 'CONSENT_EXISTS');
+      throw new AppError(
+        409,
+        'Consent already exists for this doctor.',
+        'CONSENT_EXISTS',
+      );
     }
 
-    // Create consent (skip blockchain transaction hash for demo)
+    // Consent is stored in PostgreSQL.
+    // Blockchain-backed consent must be implemented separately.
     const consent = await this.consentRepository.grant({
       patientUserId,
       doctorUserId: doctorId,
-      expiresAt: expiresAt || '2026-12-31T23:59:59Z',
-      transactionHash: null
+      expiresAt: new Date(expiresAt),
+      transactionHash: null,
     });
 
-    // Audit log
+    // audit_events.resource_id is UUID, so use a valid UUID here.
+    // Preserve both user IDs in metadata.
+    const resourceId = consent.doctor_user_id;
+
     await this.auditService?.record({
       eventType: 'consent_granted',
       actorUserId: patientUserId,
       subjectUserId: patientUserId,
       resourceType: 'consent',
-      resourceId: consent.id,
-      metadata: { doctorId }
+      resourceId,
+      metadata: {
+        patientId: consent.patient_user_id,
+        doctorId: consent.doctor_user_id,
+      },
     });
 
     return {
-      id: consent.id,
+      id: `${consent.patient_user_id}:${consent.doctor_user_id}`,
       patientUserId: consent.patient_user_id,
       doctorUserId: consent.doctor_user_id,
       expiresAt: consent.expires_at,
-      createdAt: consent.created_at
+      createdAt: consent.created_at,
     };
   }
 
-    async assertDoctorAccess(patientUserId, doctorUserId) {
+  async revoke(patientUserId, doctorId) {
+    const existing = await this.consentRepository.findActive(
+      patientUserId,
+      doctorId,
+    );
+
+    if (!existing) {
+      throw new AppError(
+        404,
+        'Consent not found.',
+        'CONSENT_NOT_FOUND',
+      );
+    }
+
+    const revoked = await this.consentRepository.revoke({
+      patientUserId,
+      doctorUserId: doctorId,
+      transactionHash: null,
+    });
+
+    if (!revoked) {
+      throw new AppError(
+        404,
+        'Consent not found or already revoked.',
+        'CONSENT_NOT_FOUND',
+      );
+    }
+
+    // resource_id must be a UUID, not a patientUUID:doctorUUID pair.
+    const resourceId = revoked.doctor_user_id;
+
+    await this.auditService?.record({
+      eventType: 'consent_revoked',
+      actorUserId: patientUserId,
+      subjectUserId: patientUserId,
+      resourceType: 'consent',
+      resourceId,
+      metadata: {
+        patientId: revoked.patient_user_id,
+        doctorId: revoked.doctor_user_id,
+      },
+    });
+
+    return {
+      id: `${revoked.patient_user_id}:${revoked.doctor_user_id}`,
+      patientUserId: revoked.patient_user_id,
+      doctorUserId: revoked.doctor_user_id,
+      revokedAt: revoked.revoked_at,
+    };
+  }
+
+  async assertDoctorAccess(patientUserId, doctorUserId) {
     const consent = await this.consentRepository.findActive(
       patientUserId,
       doctorUserId,
