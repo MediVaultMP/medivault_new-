@@ -112,14 +112,15 @@ class MemoryStorage {
     this.objects.set(key, Buffer.from(body));
   }
 
-  async get({ key }) {
+    async get({ key }) {
     const body = this.objects.get(key);
-    return body ? { body } : null;
+    return body === undefined ? undefined : { body };
   }
 
   async delete({ key }) {
     this.objects.delete(key);
   }
+
 }
 
 function api() {

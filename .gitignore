@@ -9,6 +9,8 @@ uploads/
 *.txt
 test-*.jpg
 demo-record.pdf
+blockchain/artifacts/
+blockchain/cache/
 
 
 # Local secrets, backups, and generated files

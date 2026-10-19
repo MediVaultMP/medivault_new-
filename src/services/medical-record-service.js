@@ -23,10 +23,6 @@ export class MedicalRecordService {
     this.auditService = auditService;
   }
 
-  // --------------------------------------------------
-  // UPLOAD MEDICAL RECORDS
-  // --------------------------------------------------
-
   async uploadOwnRecord(patientUserId, file, metadata) {
     return this.uploadRecord({
       patientUserId,
@@ -36,12 +32,7 @@ export class MedicalRecordService {
     });
   }
 
-  async uploadRecordForDoctor(
-    doctorUserId,
-    patientUserId,
-    file,
-    metadata
-  ) {
+  async uploadRecordForDoctor(doctorUserId, patientUserId, file, metadata) {
     await this.consentService.assertDoctorAccess(
       patientUserId,
       doctorUserId
@@ -85,6 +76,8 @@ export class MedicalRecordService {
 
     let record;
 
+    // Create the database record.
+    // If this fails, remove the uploaded file.
     try {
       record = await this.medicalRecordRepository.create({
         patientUserId,
@@ -106,6 +99,9 @@ export class MedicalRecordService {
       throw error;
     }
 
+    // Register the record on the blockchain.
+    // If registration fails, preserve the file and database record
+    // so registration can be retried later.
     if (this.recordRegistryClient) {
       record = await this.registerRecordOnChain(
         patientUserId,
@@ -125,15 +121,9 @@ export class MedicalRecordService {
     return this.publicRecord(record);
   }
 
-  // --------------------------------------------------
-  // PATIENT RECORDS
-  // --------------------------------------------------
-
   async listOwnRecords(patientUserId) {
     const records =
-      await this.medicalRecordRepository.listForPatient(
-        patientUserId
-      );
+      await this.medicalRecordRepository.listForPatient(patientUserId);
 
     return records.map((record) => this.publicRecord(record));
   }
@@ -177,40 +167,301 @@ export class MedicalRecordService {
     };
   }
 
-  // --------------------------------------------------
-  // DOCTOR: LIST PATIENT FILES
-  // --------------------------------------------------
-
   async listRecordsForDoctor(doctorUserId, patientUserId) {
-    if (doctorUserId === patientUserId) {
-      throw new AppError(
-        400,
-        'Invalid patient account.',
-        'INVALID_PATIENT'
-      );
-    }
-
-    // Require active patient-granted doctor consent even to enumerate metadata.
-    // The patient must then approve access to each individual record separately.
-    await this.consentService.assertDoctorAccess(patientUserId, doctorUserId);
+    await this.consentService.assertDoctorAccess(
+      patientUserId,
+      doctorUserId
+    );
 
     const records =
-      await this.medicalRecordRepository.listForPatient(
+      await this.medicalRecordRepository.listForPatient(patientUserId);
+
+    return records.map((record) => this.publicRecord(record));
+  }
+
+  async downloadRecordForDoctor(
+    doctorUserId,
+    patientUserId,
+    recordId
+  ) {
+    await this.consentService.assertDoctorAccess(
+      patientUserId,
+      doctorUserId
+    );
+
+    const record =
+      await this.medicalRecordRepository.findByIdForPatient(
+        recordId,
         patientUserId
       );
 
-    return records.map((record) => ({
-      id: record.id,
-      originalFilename: record.original_filename,
-      title: record.title,
-      category: record.category,
-      createdAt: record.created_at
-    }));
+    if (!record) {
+      throw new AppError(
+        404,
+        'Medical record not found.',
+        'RECORD_NOT_FOUND'
+      );
+    }
+    const approved =
+      await this.recordAccessRequestRepository.hasApproved({
+        recordId,
+        patientUserId,
+        doctorUserId
+      });
+
+    if (!approved) {
+      throw new AppError(
+        403,
+        'Access to this medical record has not been approved.',
+        'RECORD_ACCESS_NOT_APPROVED'
+      );
+    }
+
+    const { body: ciphertext } = await this.medicalStorage.get({
+      key: record.storage_key
+    });
+
+    const body = this.fileEncryptionService.decrypt(
+      ciphertext,
+      record
+    );
+
+    await this.auditService?.record({
+      eventType: 'record_accessed',
+      actorUserId: doctorUserId,
+      subjectUserId: patientUserId,
+      resourceType: 'medical_record',
+      resourceId: record.id,
+      metadata: {
+        access: 'consented_doctor'
+      }
+    });
+
+    return {
+      record: this.publicRecord(record),
+      body
+    };
   }
 
-  // --------------------------------------------------
-  // DOCTOR: REQUEST ACCESS TO A SPECIFIC FILE
-  // --------------------------------------------------
+  async setOwnRecordEmergencyEssential(
+    patientUserId,
+    recordId,
+    isEmergencyEssential
+  ) {
+    const record =
+      await this.medicalRecordRepository.setEmergencyEssential(
+        recordId,
+        patientUserId,
+        isEmergencyEssential
+      );
+
+    if (!record) {
+      throw new AppError(
+        404,
+        'Medical record not found.',
+        'RECORD_NOT_FOUND'
+      );
+    }
+
+    await this.auditService?.record({
+      eventType: 'emergency_record_classification_changed',
+      actorUserId: patientUserId,
+      subjectUserId: patientUserId,
+      resourceType: 'medical_record',
+      resourceId: record.id,
+      metadata: {
+        isEmergencyEssential
+      }
+    });
+
+    return this.publicRecord(record);
+  }
+
+  async verifyOwnRecord(patientUserId, recordId) {
+    const record =
+      await this.medicalRecordRepository.findByIdForPatient(
+        recordId,
+        patientUserId
+      );
+
+    if (!record) {
+      throw new AppError(
+        404,
+        'Medical record not found.',
+        'RECORD_NOT_FOUND'
+      );
+    }
+
+    if (!record.content_sha256) {
+      throw new AppError(
+        409,
+        'This legacy record has no integrity hash. Re-upload it to verify integrity.',
+        'HASH_UNAVAILABLE'
+      );
+    }
+
+    try {
+      const { body: ciphertext } = await this.medicalStorage.get({
+        key: record.storage_key
+      });
+
+      const plaintext = this.fileEncryptionService.decrypt(
+        ciphertext,
+        record
+      );
+
+      const localValid = this.hashesMatch(
+        this.createSha256(plaintext),
+        record.content_sha256
+      );
+
+      let blockchainValid = null;
+
+      if (
+        record.blockchain_status === 'registered' &&
+        this.recordRegistryClient
+      ) {
+        const blockchainResult =
+          await this.recordRegistryClient.verifyRecord({
+            recordId: record.id,
+            contentSha256: record.content_sha256
+          });
+
+                blockchainValid =
+          typeof blockchainResult === 'boolean'
+            ? blockchainResult
+            : blockchainResult?.valid === true;
+      }
+
+      return {
+        recordId: record.id,
+        valid: localValid && blockchainValid === true,
+        localValid,
+        blockchainValid
+      };
+    } catch (error) {
+      if (error.code === 'DECRYPTION_FAILED') {
+        return {
+          recordId: record.id,
+          valid: false,
+          localValid: false,
+          blockchainValid: null
+        };
+      }
+
+      throw error;
+    }
+  }
+
+  async registerOwnRecordOnChain(patientUserId, recordId) {
+    const record =
+      await this.medicalRecordRepository.findByIdForPatient(
+        recordId,
+        patientUserId
+      );
+
+    if (!record) {
+      throw new AppError(
+        404,
+        'Medical record not found.',
+        'RECORD_NOT_FOUND'
+      );
+    }
+
+    if (record.blockchain_status === 'registered') {
+      return this.publicRecord(record);
+    }
+
+    const registeredRecord =
+      await this.registerRecordOnChain(patientUserId, record);
+
+    return this.publicRecord(registeredRecord);
+  }
+
+  async registerRecordOnChain(patientUserId, record) {
+    const patient =
+      await this.userRepository.findById(patientUserId);
+
+    if (!patient?.blockchain_address) {
+      throw new AppError(
+        409,
+        'Add a blockchain wallet address before registering records.',
+        'WALLET_REQUIRED'
+      );
+    }
+
+    try {
+      const registration =
+        await this.recordRegistryClient.registerRecord({
+          recordId: record.id,
+          contentSha256: record.content_sha256,
+          patientAddress: patient.blockchain_address
+        });
+
+      return await this.medicalRecordRepository
+        .markBlockchainRegistered(record.id, registration);
+    } catch (error) {
+      await this.medicalRecordRepository
+        .markBlockchainFailed(record.id);
+
+      throw new AppError(
+        502,
+        'Blockchain registration failed. Retry the registration after resolving the issue.',
+        'BLOCKCHAIN_REGISTRATION_FAILED'
+      );
+    }
+  }
+
+  createStorageKey(patientUserId, originalFilename) {
+    const extension = path
+      .extname(originalFilename)
+      .toLowerCase()
+      .replace(/[^.a-z0-9]/g, '')
+      .slice(0, 12);
+
+    return `medical-records/${patientUserId}/${crypto.randomUUID()}${extension}`;
+  }
+
+  createSha256(buffer) {
+    return crypto
+      .createHash('sha256')
+      .update(buffer)
+      .digest('hex');
+  }
+
+
+  hashesMatch(actual, expected) {
+    if (
+      typeof actual !== 'string' ||
+      typeof expected !== 'string' ||
+      !/^[a-f0-9]{64}$/i.test(actual) ||
+      !/^[a-f0-9]{64}$/i.test(expected)
+    ) {
+      return false;
+    }
+
+    const actualBuffer = Buffer.from(actual, 'hex');
+    const expectedBuffer = Buffer.from(expected, 'hex');
+
+    return (
+      actualBuffer.length === expectedBuffer.length &&
+      crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+    );
+  }
+
+  publicRecord(record) {
+    return {
+      id: record.id,
+      patientUserId: record.patient_user_id,
+      originalFilename: record.original_filename,
+      contentType: record.content_type,
+      sizeBytes: record.size_bytes,
+      title: record.title,
+      category: record.category,
+      blockchainStatus: record.blockchain_status,
+      createdAt: record.created_at
+    };
+  }
 
   async requestRecordAccess(
     doctorUserId,
@@ -274,19 +525,11 @@ export class MedicalRecordService {
     return request;
   }
 
-  // --------------------------------------------------
-  // PATIENT: VIEW ACCESS REQUESTS
-  // --------------------------------------------------
-
   async listRecordAccessRequestsForPatient(patientUserId) {
     return this.recordAccessRequestRepository.listForPatient(
       patientUserId
     );
   }
-
-  // --------------------------------------------------
-  // PATIENT: APPROVE, REJECT OR REVOKE ACCESS
-  // --------------------------------------------------
 
   async decideRecordAccessRequest(
     patientUserId,
@@ -329,313 +572,5 @@ export class MedicalRecordService {
     });
 
     return request;
-  }
-
-  // --------------------------------------------------
-  // DOCTOR: DOWNLOAD A PATIENT FILE
-  // --------------------------------------------------
-
-  async downloadRecordForDoctor(
-    doctorUserId,
-    patientUserId,
-    recordId
-  ) {
-    await this.consentService.assertDoctorAccess(
-      patientUserId,
-      doctorUserId
-    );
-
-    const record =
-      await this.medicalRecordRepository.findByIdForPatient(
-        recordId,
-        patientUserId
-      );
-
-    if (!record) {
-      throw new AppError(
-        404,
-        'Medical record not found.',
-        'RECORD_NOT_FOUND'
-      );
-    }
-
-    // File-specific approval is required before accessing storage.
-    const approved =
-      await this.recordAccessRequestRepository.hasApproved({
-        recordId: record.id,
-        patientUserId,
-        doctorUserId
-      });
-
-    if (!approved) {
-      throw new AppError(
-        403,
-        'The patient has not approved access to this specific file.',
-        'RECORD_ACCESS_NOT_APPROVED'
-      );
-    }
-
-    // Retrieve and decrypt the file only after authorization.
-    const { body: ciphertext } = await this.medicalStorage.get({
-      key: record.storage_key
-    });
-
-    const body = this.fileEncryptionService.decrypt(
-      ciphertext,
-      record
-    );
-
-    await this.auditService?.record({
-      eventType: 'record_accessed',
-      actorUserId: doctorUserId,
-      subjectUserId: patientUserId,
-      resourceType: 'medical_record',
-      resourceId: record.id,
-      metadata: {
-        access: 'approved_file_specific_request'
-      }
-    });
-
-    return {
-      record: this.publicRecord(record),
-      body
-    };
-  }
-
-  // --------------------------------------------------
-  // EMERGENCY RECORD CLASSIFICATION
-  // --------------------------------------------------
-
-  async setOwnRecordEmergencyEssential(
-    patientUserId,
-    recordId,
-    isEmergencyEssential
-  ) {
-    const record =
-      await this.medicalRecordRepository.setEmergencyEssential(
-        recordId,
-        patientUserId,
-        isEmergencyEssential
-      );
-
-    if (!record) {
-      throw new AppError(
-        404,
-        'Medical record not found.',
-        'RECORD_NOT_FOUND'
-      );
-    }
-
-    await this.auditService?.record({
-      eventType: 'emergency_record_classification_changed',
-      actorUserId: patientUserId,
-      subjectUserId: patientUserId,
-      resourceType: 'medical_record',
-      resourceId: record.id,
-      metadata: {
-        isEmergencyEssential
-      }
-    });
-
-    return this.publicRecord(record);
-  }
-
-  // --------------------------------------------------
-  // INTEGRITY VERIFICATION
-  // --------------------------------------------------
-
-  async verifyOwnRecord(patientUserId, recordId) {
-    const record =
-      await this.medicalRecordRepository.findByIdForPatient(
-        recordId,
-        patientUserId
-      );
-
-    if (!record) {
-      throw new AppError(
-        404,
-        'Medical record not found.',
-        'RECORD_NOT_FOUND'
-      );
-    }
-
-    if (!record.content_sha256) {
-      throw new AppError(
-        409,
-        'This legacy record has no integrity hash. Re-upload it to verify integrity.',
-        'HASH_UNAVAILABLE'
-      );
-    }
-
-    try {
-      const { body: ciphertext } = await this.medicalStorage.get({
-        key: record.storage_key
-      });
-
-      const plaintext = this.fileEncryptionService.decrypt(
-        ciphertext,
-        record
-      );
-
-      const localValid = this.hashesMatch(
-        this.createSha256(plaintext),
-        record.content_sha256
-      );
-
-      let blockchainValid = null;
-
-      if (
-        record.blockchain_status === 'registered' &&
-        this.recordRegistryClient
-      ) {
-        const blockchainResult =
-          await this.recordRegistryClient.verifyRecord({
-            recordId: record.id,
-            contentSha256: record.content_sha256
-          });
-
-        blockchainValid =
-          typeof blockchainResult === 'boolean'
-            ? blockchainResult
-            : blockchainResult?.valid === true;
-      }
-
-      return {
-        recordId: record.id,
-        // Full verification requires both local integrity and
-        // an explicit successful blockchain verification.
-        valid: localValid && blockchainValid === true,
-        localValid,
-        blockchainValid
-      };
-    } catch (error) {
-      if (error.code === 'DECRYPTION_FAILED') {
-        return {
-          recordId: record.id,
-          valid: false,
-          localValid: false,
-          blockchainValid: null
-        };
-      }
-
-      throw error;
-    }
-  }
-
-  // --------------------------------------------------
-  // BLOCKCHAIN REGISTRATION
-  // --------------------------------------------------
-
-  async registerOwnRecordOnChain(patientUserId, recordId) {
-    const record =
-      await this.medicalRecordRepository.findByIdForPatient(
-        recordId,
-        patientUserId
-      );
-
-    if (!record) {
-      throw new AppError(
-        404,
-        'Medical record not found.',
-        'RECORD_NOT_FOUND'
-      );
-    }
-
-    if (record.blockchain_status === 'registered') {
-      return this.publicRecord(record);
-    }
-
-    const registeredRecord =
-      await this.registerRecordOnChain(patientUserId, record);
-
-    return this.publicRecord(registeredRecord);
-  }
-
-  async registerRecordOnChain(patientUserId, record) {
-    const patient =
-      await this.userRepository.findById(patientUserId);
-
-    if (!patient?.blockchain_address) {
-      throw new AppError(
-        409,
-        'Add a blockchain wallet address before registering records.',
-        'WALLET_REQUIRED'
-      );
-    }
-
-    try {
-      const registration =
-        await this.recordRegistryClient.registerRecord({
-          recordId: record.id,
-          contentSha256: record.content_sha256,
-          patientAddress: patient.blockchain_address
-        });
-
-      return await this.medicalRecordRepository
-        .markBlockchainRegistered(record.id, registration);
-    } catch (error) {
-      await this.medicalRecordRepository
-        .markBlockchainFailed(record.id);
-
-      throw new AppError(
-        502,
-        'Blockchain registration failed. Retry the registration after resolving the issue.',
-        'BLOCKCHAIN_REGISTRATION_FAILED'
-      );
-    }
-  }
-
-  // --------------------------------------------------
-  // UTILITIES
-  // --------------------------------------------------
-
-  createStorageKey(patientUserId, originalFilename) {
-    const extension = path
-      .extname(originalFilename)
-      .toLowerCase()
-      .replace(/[^.a-z0-9]/g, '')
-      .slice(0, 12);
-
-    return `medical-records/${patientUserId}/${crypto.randomUUID()}${extension}`;
-  }
-
-  createSha256(buffer) {
-    return crypto
-      .createHash('sha256')
-      .update(buffer)
-      .digest('hex');
-  }
-
-  hashesMatch(actual, expected) {
-    if (
-      typeof actual !== 'string' ||
-      typeof expected !== 'string' ||
-      !/^[a-f0-9]{64}$/i.test(actual) ||
-      !/^[a-f0-9]{64}$/i.test(expected)
-    ) {
-      return false;
-    }
-
-    const actualBuffer = Buffer.from(actual, 'hex');
-    const expectedBuffer = Buffer.from(expected, 'hex');
-
-    return (
-      actualBuffer.length === expectedBuffer.length &&
-      crypto.timingSafeEqual(actualBuffer, expectedBuffer)
-    );
-  }
-
-  publicRecord(record) {
-    return {
-      id: record.id,
-      patientUserId: record.patient_user_id,
-      originalFilename: record.original_filename,
-      contentType: record.content_type,
-      sizeBytes: record.size_bytes,
-      title: record.title,
-      category: record.category,
-      blockchainStatus: record.blockchain_status,
-      createdAt: record.created_at
-    };
   }
 }

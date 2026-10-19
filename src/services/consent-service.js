@@ -1,4 +1,3 @@
-
 import { AppError } from '../utils/app-error.js';
 
 export class ConsentService {
