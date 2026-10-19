@@ -33,7 +33,7 @@ export default function EmergencyAccess() {
     const updateCountdown = () => {
       const secondsRemaining = Math.max(
         0,
-        Math.ceil((new Date(grant.expiresAt).getTime() - Date.now()) / 1000),
+        Math.ceil((new Date(grant.expiresAt).getTime() - Date.now()) / 1000)
       );
 
       setLeft(secondsRemaining);
@@ -93,7 +93,7 @@ export default function EmergencyAccess() {
 
     try {
       const requestedExpiry = new Date(
-        Date.now() + minutes * 60 * 1000,
+        Date.now() + minutes * 60 * 1000
       ).toISOString();
 
       const response = await api.grantEmergencyAccess({
@@ -115,8 +115,9 @@ export default function EmergencyAccess() {
       }
 
       // Fetch records only after access creation succeeds.
-      const emergencyRecords =
-        await api.getEmergencyEssentialRecords(normalizedPatientId);
+      const emergencyRecords = await api.getEmergencyEssentialRecords(
+        normalizedPatientId
+      );
 
       setGrant({
         patientId: normalizedPatientId,
@@ -128,9 +129,7 @@ export default function EmergencyAccess() {
       setConfirmed(false);
     } catch (err) {
       if (err.status === 404) {
-        setError(
-          "No patient was found, or the requested resource is unavailable.",
-        );
+        setError("No patient was found, or the requested resource is unavailable.");
       } else if (err.status === 400) {
         setError("The request was rejected. Check the reason and duration.");
       } else if (err.status === 401 || err.status === 403) {
@@ -138,7 +137,7 @@ export default function EmergencyAccess() {
       } else {
         setError(
           err.message ||
-            "Emergency access could not be completed. Please try again.",
+            "Emergency access could not be completed. Please try again."
         );
       }
 
@@ -197,13 +196,13 @@ export default function EmergencyAccess() {
               className="mono"
               value={patientId}
               onChange={(event) => setPatientId(event.target.value)}
-              placeholder="MV-XXXXXXXX"
+              placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
               autoComplete="off"
               required
             />
             <div className="field-hint">
-              Enter the patient ID supplied through your authorized clinical
-              workflow.
+              Enter the patient UUID supplied through your authorized
+              clinical workflow.
             </div>
           </div>
 
@@ -274,7 +273,10 @@ export default function EmergencyAccess() {
           )}
 
           {success && (
-            <p role="status" style={{ color: "var(--primary)", fontSize: 13 }}>
+            <p
+              role="status"
+              style={{ color: "var(--primary)", fontSize: 13 }}
+            >
               {success}
             </p>
           )}
@@ -307,7 +309,9 @@ export default function EmergencyAccess() {
           {grant && (
             <>
               <div
-                className={`badge ${active ? "badge-red" : "badge-muted"}`}
+                className={`badge ${
+                  active ? "badge-red" : "badge-muted"
+                }`}
                 role="status"
                 aria-live="polite"
               >
@@ -339,8 +343,8 @@ export default function EmergencyAccess() {
                     marginTop: 14,
                   }}
                 >
-                  The session has expired. Records are hidden in this interface.
-                  A new request must be authorized by the backend.
+                  The session has expired. Records are hidden in this
+                  interface. A new request must be authorized by the backend.
                 </p>
               )}
 
@@ -352,7 +356,8 @@ export default function EmergencyAccess() {
                     marginTop: 14,
                   }}
                 >
-                  No emergency-essential records were returned for this patient.
+                  No emergency-essential records were returned for this
+                  patient.
                 </p>
               )}
 
